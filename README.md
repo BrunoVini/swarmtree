@@ -5,14 +5,14 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Claude_Code-%E2%89%A5_2.1.287-D97757?logo=claude&logoColor=fff" alt="Claude Code 2.1.287 or newer">
+  <img src="https://img.shields.io/badge/Claude_Code-%E2%89%A5_2.1.306-D97757?logo=claude&logoColor=fff" alt="Claude Code 2.1.306 or newer">
   <img src="https://img.shields.io/badge/version-0.7.1-blue" alt="Version">
   <img src="https://img.shields.io/badge/type-mod-6f42c1" alt="Claude Code mod">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
 > [!NOTE]
-> swarmtree is a fork of [claude-code-filetree](https://github.com/data-goblin/claude-code-filetree) by Kurt Buhler, which gives it the tree, git status, the shimmer on what Claude touches and the settings below. It is a Claude Code **mod** and needs **Claude Code 2.1.287+**. It shows in the right sidebar, which in the terminal needs the fullscreen layout (`/tui fullscreen`) and a terminal at least 110 columns wide; the Desktop app docks it on its own, and `/swarmtree` reopens it there after you close it.
+> swarmtree is a fork of [claude-code-filetree](https://github.com/data-goblin/claude-code-filetree) by Kurt Buhler, which gives it the tree, git status, the shimmer on what Claude touches and the settings below. It is a Claude Code **mod** and needs **Claude Code 2.1.306+**. It shows in the right sidebar, which in the terminal needs the fullscreen layout (`/tui fullscreen`) and a terminal at least 110 columns wide; the Desktop app docks it on its own, and `/swarmtree` reopens it there after you close it.
 
 ---
 
