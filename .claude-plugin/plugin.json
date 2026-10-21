@@ -1,7 +1,7 @@
 {
   "name": "filetree",
-  "version": "0.2.26",
-  "description": "An IDE-style file tree for Claude Code that shows what Claude is doing and where in files",
+  "version": "0.7.1",
+  "description": "IDE-style file tree for Claude Code: diff peek on double-click, per-subagent colors, worktree-aware activity",
   "types": "./types/index.d.ts",
   "author": {
     "name": "Kurt Buhler"
@@ -81,7 +81,7 @@
     "open": {
       "type": "string",
       "title": "Open with",
-      "description": "What a double-click or Enter does with a file. Empty: the default app, also inside tmux. editor: use $VISUAL, then $EDITOR, then vi in tmux (Linux/macOS only; otherwise shows a notice). preview: show it in the pane (left goes back; ↗ always opens the default app). Anything else is a command run instead: {path} is the file and {dir} its folder; without {path} the path goes last. Words split on spaces, quotes keep a word whole, and no shell runs it. It should start the viewer and return; on Linux it runs detached.",
+      "description": "What a double-click or Enter does with a file. Empty: the default app, also inside tmux. editor: use $VISUAL, then $EDITOR, then vi in tmux (Linux/macOS only; otherwise shows a notice). preview: show it in the pane (left goes back; \u2197 always opens the default app). Anything else is a command run instead: {path} is the file and {dir} its folder; without {path} the path goes last. Words split on spaces, quotes keep a word whole, and no shell runs it. It should start the viewer and return; on Linux it runs detached.",
       "default": ""
     },
     "edit": {

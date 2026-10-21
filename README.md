@@ -68,6 +68,19 @@ Install fails with `Unrecognized key: "options"`? Your Claude Code is older than
 - On Omarchy, the pane takes its colors and background from the current theme and follows theme switches
 - A light `/config` theme in the terminal gets its own palette, with every text color at WCAG AAA contrast (7:1 or more), also on the selected and hovered rows
 
+### Fork additions
+
+- Double-click a file to peek at its diff against HEAD over the whole pane; `w`/`s`/`a`/`d` scroll, `n`/`p` jump between hunks, `t` switches to the diff in the worktree of a subagent that touched the file, `q` goes back (Ctrl+click still opens the default app)
+- In the peek, `i` opens the file to type in (up to 1 MB, not binary): `save` shows once something changed, Enter saves too, the file keeps its CRLF or LF; a file an agent changed since you opened it is only overwritten on a second save, and leaving with unsaved changes takes a second press
+- The footer creates and deletes: `+ new` asks for a name and makes it in the folder under the cursor or of the selected file (`name/` makes a folder, `a/b.ts` the folders on the way); with a file selected, `✕ delete` asks `yes, delete` / `cancel` first. Only files are deleted, only inside the tree; Linux and macOS
+- Tabs: `1` files, `2` changes only, `3` commit graph (double-click or `o` opens a commit's diff), `4` agents (each subagent's writes, reads and last call; `d` opens its files, `o` a file's diff)
+- Each subagent gets a color: a chip above the prompt, a dot on the `Agent(...)` row and on every file and closed folder it touched; viewing a subagent's transcript shows only its work and its children's. A darker set of colors is used on a light terminal
+- Subagents working in git worktrees are followed: their files light on the main tree, their commits get their dot in the graph, and their branches show as `⎇`
+- Two live subagents writing the same file put a `⚠` on it and say so once
+- Typing a path at the prompt (`@src/a` or anything with a `/`) opens the tree down to it while the cursor is in it: `⌕` found, `…` with the matches its last segment begins, `✗ path does not exist` otherwise; leaving the path puts the tree back
+- What the subagents did is kept across `/reload-plugins`
+- The git index and HEAD are polled, so staging and commits made outside Claude show up even when another plugin's SessionStart hook keeps the file watch from registering
+
 ### Keyboard navigation
 
 With the filetree pane focused, use `j`/`k` to move down/up, `l` to expand a folder, and `h` to collapse it or move to its parent. `o` or Enter opens a file or toggles a folder. Press `s` to focus search, type a query, then Enter to jump to the first match and return focus to the tree controls.

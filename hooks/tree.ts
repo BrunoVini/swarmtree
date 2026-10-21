@@ -50,6 +50,7 @@ export function emptyTree(root: string): FileTree {
     scroll: null,
     preview: '',
     previewTop: 0,
+    tab: 'files',
   }
 }
 
@@ -288,6 +289,14 @@ export function relative(root: string, path: string): string {
   return path === root ? '' : path.slice(root.endsWith('/') ? root.length : root.length + 1)
 }
 
+// A path in another worktree of the repo, as the same file in this one: a
+// subagent editing its own checkout lights the file it would change here.
+// `worktrees` comes longest first, so one nested inside this tree wins.
+export function ontoMain(top: string, worktrees: string[], path: string): string {
+  const w = worktrees.find(r => r !== top && inside(r, path))
+  return w ? join(top, relative(w, path)).replace(/\/$/, '') : path
+}
+
 export function visibleRows(t: FileTree): Row[] {
   const kids = new Map<string, FileNode[]>()
   for (const n of t.nodes) {
@@ -306,12 +315,16 @@ export function visibleRows(t: FileTree): Row[] {
       for (const a of ancestorsOf(n.id, t.root)) keep.add(a)
     }
   }
+  // The changes tab keeps what git reports and the folders above it; with nothing changed it keeps nothing.
+  const changed = t.tab === 'changes' ? new Set(Object.keys(t.git)) : null
+  const shows = (id: string) => (!keep || keep.has(id)) && (!changed || changed.has(id) || t.untrackedDirs.some(d => inside(d, id)))
+  const filtered = Boolean(keep || changed)
   const open = new Set(t.expanded)
   const rows: Row[] = []
   const walk = (dir: string, depth: number) => {
     for (const n of kids.get(dir) ?? []) {
-      if (keep && !keep.has(n.id)) continue
-      const isOpen = n.kind === 'dir' && (keep ? kids.has(n.id) : open.has(n.id))
+      if (!shows(n.id)) continue
+      const isOpen = n.kind === 'dir' && (filtered ? kids.has(n.id) : open.has(n.id))
       rows.push({ node: n, depth, open: isOpen })
       if (isOpen) walk(n.id, depth + 1)
     }
@@ -351,4 +364,14 @@ export function formatSize(bytes: number): string {
     i++
   }
   return `${v < 100 ? v.toFixed(1) : Math.round(v)} ${units[i]}`
+}
+
+// The path being typed at the prompt's cursor: the word around it when it is an @mention or holds a
+// slash (a URL does not count), without the @, a #L line fragment or wrapping quotes; '' otherwise.
+export function pathAt(text: string, cursor: number): string {
+  const start = text.slice(0, cursor).search(/\S*$/)
+  const word = text.slice(start, cursor + (/^\S*/.exec(text.slice(cursor))?.[0].length ?? 0))
+  if (!word || word.includes('://')) return ''
+  const bare = word.replace(/^["'`(]+/, '').replace(/^@/, '').replace(/#L[\d-]*$/, '').replace(/["'`),;:!?]+$/, '')
+  return word.replace(/^["'`(]+/, '').startsWith('@') || bare.includes('/') ? bare : ''
 }

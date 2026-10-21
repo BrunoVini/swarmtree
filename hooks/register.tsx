@@ -1,10 +1,13 @@
-import { type BuiltinToolResults, type EngineInterface, type Register, type Timer, update } from 'claude-code'
+import { type AgentInfo, type BuiltinToolResults, type EngineInterface, type Register, type Timer, update } from 'claude-code'
 import { LINUX_LAUNCH, openCommand, openWithCommand, tmuxOpenCommand } from './open'
 import type { ButtonProps } from './button'
 
-import type { Activity, FileNode, FileTree, Theme } from '../types'
+import type { Activity, AgentBook, FileNode, FileTree, Theme } from '../types'
 import { BRANCH_ICON, chainOf, type GitAction, gitActions, LIGHT_TONES, readOnly, readTargets, resolve, TONES } from './git'
 import type { RowSpec, RowsProps, Seg } from './rows'
+import { addedDiff, byFile, type DiffLine, diffLines, diffWindow, hunkStarts } from './peek'
+import { type GraphRow, layout, LOG_FORMAT, parseLog, refKind } from './graph'
+import { byLineage, seenFrom, writerAt } from './agents'
 import { CHEVRON_CLOSED, CHEVRON_OPEN, fileIcon, GIT_COLOR, LIGHT_GIT_COLOR } from './icons'
 import {
   age,
@@ -19,9 +22,11 @@ import {
   join,
   LIGHT_THEME,
   mapper,
+  ontoMain,
   parseGit,
   parseNumstat,
   parseTheme,
+  pathAt,
   posix,
   relative,
   dropBelow,
@@ -38,6 +43,7 @@ import {
 const TREE = { plugin: 'filetree', key: 'tree' } as const
 const THEME = { plugin: 'filetree', key: 'theme' } as const
 const ACTIVITY = { plugin: 'filetree', key: 'activity' } as const
+const AGENTS = { plugin: 'filetree', key: 'agents' } as const
 const PANE = 'filetree'
 const SHIMMER = Object.fromEntries(Object.entries(TONES).map(([k, v]) => [k, { bright: v.bright, dim: v.dim }]))
 const LIGHT_SHIMMER = Object.fromEntries(Object.entries(LIGHT_TONES).map(([k, v]) => [k, { bright: v.bright, dim: v.dim }]))
@@ -56,6 +62,23 @@ const DEL_COLOR = '#e06c75'
 const LIGHT_ADD_COLOR = '#14532d'
 const LIGHT_DEL_COLOR = '#7f1d1d'
 const LIGHT_HOVER = '#f0f2f5'
+// One color per subagent, in the order they show up; the band above the prompt and the tree's dots share it.
+// The light set is the same hues, dark enough to read on a light terminal.
+const AGENT_COLORS = ['#61afef', '#c678dd', '#e5c07b', '#56b6c2', '#ff79c6', '#98c379', '#d19a66', '#bd93f9', '#f7768e', '#2ac3de']
+const LIGHT_AGENT_COLORS = ['#1d4ed8', '#7e22ce', '#a16207', '#0e7490', '#be185d', '#15803d', '#c2410c', '#6d28d9', '#b91c1c', '#0369a1']
+// ponytail: the book keeps this many agents and paths per agent, the oldest dropped first
+const BOOK_AGENTS = 40
+const BOOK_PATHS = 400
+const GIT_POLL_MS = 2000
+const LIVE_AGENT = new Set(['pending', 'running', 'waiting', 'idle'])
+const AGENT_DOTS = 4
+// An agent the session lists no longer (a workflow's, a nested one dropped early) counts as live this long after its last call.
+const UNLISTED_LIVE_MS = 90_000
+// How far a file's mtime may sit outside a command's run and still be put down to it.
+const MTIME_SLACK_MS = 1_000
+const GRAPH_LIMIT = 300
+const TAG_COLOR = '#e5c07b'
+const REMOTE_COLOR = '#61afef'
 const THEME_FILE = '.local/state/omarchy/current/theme/colors.toml'
 const THEME_POLL_MS = 2000
 const FONT_SCRIPT =
@@ -88,6 +111,38 @@ let inTmux = false
 let previewLine = 1
 let previewed: { path: string; text: string; note: string } | null = null
 let previewRows = 20
+let peek: { path: string; lines: DiffLine[]; text: string[]; note: string; commit?: boolean; agent?: string; file?: string } | null = null
+// The peeked file opened for typing: what it held then, what is typed now, its line ending, its mtime
+// then, and which act was warned about once and goes ahead on the second try.
+let editing: { file: string; original: string; draft: string; crlf: boolean; mtimeMs: number; armed: '' | 'leave' | 'save' } | null = null
+const EDIT_MAX_BYTES = 1_000_000
+// The footer's file act in progress: naming a new file in a folder, or confirming a delete.
+let fileAct: { kind: 'new'; dir: string; name: string } | { kind: 'delete'; path: string } | null = null
+let peekTop = 0
+const emptyBook = (): AgentBook => ({ colors: {}, reads: {}, writes: {}, names: {}, worktrees: {}, last: {}, commits: {} })
+let book = emptyBook()
+let bookSave: Timer | null = null
+const lastSeen = new Map<string, number>()
+const warned = new Set<string>()
+let agentOpen = new Set<string>()
+let agentCursor = ''
+let agentTop = 0
+let agentRoom = 20
+// The agent whose transcript the pane last drew for, so keys in tab 4 walk the rows it shows.
+let agentView: string | undefined
+let gitPoll: Timer | null = null
+let gitStamp = ''
+// The path typed at the prompt: what it found, and the tree as it was before it opened anything.
+let promptHint: { typed: string; state: 'found' | 'partial' | 'missing' | 'outside'; matches: number } | null = null
+let promptSnap: Pick<FileTree, 'expanded' | 'cursor' | 'scroll' | 'tab'> | null = null
+let promptBox: { text: string; cursor: number } | null = null
+let promptRun: Promise<void> | null = null
+let graph: { top: string; rows: GraphRow[]; remotes: string[] } = { top: '', rows: [], remotes: [] }
+let graphTop = 0
+let graphRoom = 20
+let graphCursor = ''
+let peekLeft = 0
+let peekBody = 20
 let follow = true
 let followClaude = true
 let scanning: Promise<void> | null = null
@@ -224,6 +279,140 @@ async function git($: EngineInterface, cwd: string, args: string[], timeoutMs = 
   return $.process.run(['git', '--no-optional-locks', '-C', cwd, ...args], { timeoutMs, env: { GIT_OPTIONAL_LOCKS: '0' } })
 }
 
+let worktreeCache = { top: '', at: 0, roots: [] as string[], branches: {} as Record<string, string> }
+
+// ponytail: re-listed at most every 3s, since subagents add and drop worktrees mid-run
+async function worktreeRoots($: EngineInterface): Promise<string[]> {
+  const t = await get($)
+  if (!t.top) return []
+  const now = await $.clock.now()
+  if (worktreeCache.top === t.top && now - worktreeCache.at < 3_000) return worktreeCache.roots
+  const run = await git($, t.top, ['worktree', 'list', '--porcelain'], 5_000).catch(() => null)
+  const roots: string[] = []
+  const branches: Record<string, string> = {}
+  for (const block of run?.exitCode === 0 ? run.stdout.split('\n\n') : []) {
+    const root = posix(/^worktree (.+)$/m.exec(block)?.[1] ?? '')
+    if (!root || root === t.top) continue
+    roots.push(root)
+    const branch = /^branch refs\/heads\/(.+)$/m.exec(block)?.[1]
+    if (branch) branches[root] = branch
+  }
+  worktreeCache = { top: t.top, at: now, roots: roots.sort((a, b) => b.length - a.length), branches }
+  return worktreeCache.roots
+}
+
+function palette(): string[] {
+  return lightTerminal && !themeMtime ? LIGHT_AGENT_COLORS : AGENT_COLORS
+}
+
+function saveBook($: EngineInterface): void {
+  bookSave?.cancel()
+  bookSave = $.clock.after(500, () => {
+    bookSave = null
+    const ids = Object.keys(book.colors).sort((a, b) => (book.last[b]?.at ?? 0) - (book.last[a]?.at ?? 0))
+    for (const id of ids.slice(BOOK_AGENTS)) for (const k of ['colors', 'reads', 'writes', 'names', 'worktrees', 'last'] as const) delete book[k][id]
+    book.commits = Object.fromEntries(Object.entries(book.commits).slice(-200))
+    void $.state.set(AGENTS, book).catch(() => undefined)
+  })
+}
+
+async function loadBook($: EngineInterface): Promise<void> {
+  const saved = (await $.state.get(AGENTS).catch(() => null))?.value
+  if (!saved) return
+  // What this run already saw stays on top of what the last one left.
+  const now = book
+  book = emptyBook()
+  for (const k of Object.keys(book) as (keyof AgentBook)[]) Object.assign(book[k], saved[k] ?? {}, now[k])
+}
+
+function nameOf(id: string): string {
+  return book.names[id] || 'subagent'
+}
+
+function lastCall(e: { tool: string } & Record<string, unknown>): string {
+  const target = ['file_path', 'notebook_path', 'pattern', 'command', 'description'].map(k => e[k]).find(v => typeof v === 'string') as string | undefined
+  const short = (target ?? '').split('\n')[0] ?? ''
+  return `${e.tool}${short ? ` ${short.length > 60 ? `${short.slice(0, 59)}…` : short}` : ''}`
+}
+
+function colorOf(agentId: string): string {
+  if (!(agentId in book.colors)) book.colors[agentId] = Object.keys(book.colors).length
+  const colors = palette()
+  return colors[(book.colors[agentId] ?? 0) % colors.length] ?? '#61afef'
+}
+
+function touchedBy(id: string): string[] {
+  return [...(book.writes[id] ?? []), ...(book.reads[id] ?? [])]
+}
+
+// Where a subagent has been: each file its calls read or wrote, on the main tree. A file a second
+// agent still at work writes too is a conflict, told once.
+function mark($: EngineInterface, agentId: string | undefined, paths: string[], write = false): void {
+  if (!agentId || paths.length === 0) return
+  colorOf(agentId)
+  const list = (write ? book.writes : book.reads)[agentId] ?? []
+  for (const p of paths) if (!list.includes(p)) list.push(p)
+  ;(write ? book.writes : book.reads)[agentId] = list.slice(-BOOK_PATHS)
+  saveBook($)
+  if (!write) return
+  void (async () => {
+    const now = await $.clock.now()
+    for (const p of paths) {
+      const others = Object.keys(book.writes).filter(id => id !== agentId && book.writes[id]?.includes(p) && now - (lastSeen.get(id) ?? 0) < UNLISTED_LIVE_MS)
+      const key = `${p}\0${[agentId, ...others].sort().join()}`
+      if (others.length === 0 || warned.has(key)) continue
+      warned.add(key)
+      const t = await get($)
+      $.ui.toast(`⚠ ${inside(t.root, p) ? relative(t.root, p) : shortPath(p)} is being written by ${[agentId, ...others].map(nameOf).join(' and ')}`)
+    }
+  })()
+}
+
+// The worktree a subagent works in, from a path of its calls that lies in one.
+async function noteWorktree($: EngineInterface, agentId: string | undefined, paths: string[]): Promise<void> {
+  if (!agentId || paths.length === 0) return
+  const roots = await worktreeRoots($)
+  const root = roots.find(r => paths.some(p => inside(r, posix(p))))
+  if (root && book.worktrees[agentId] !== root) {
+    book.worktrees[agentId] = root
+    saveBook($)
+  }
+}
+
+async function allAgents($: EngineInterface): Promise<AgentInfo[]> {
+  const listed = await $.agent.list().catch(() => [] as AgentInfo[])
+  for (const a of listed) {
+    const name = a.name || a.description || a.type
+    if (name && book.names[a.id] !== name) {
+      book.names[a.id] = name
+      saveBook($)
+    }
+  }
+  return listed
+}
+
+async function liveAgents($: EngineInterface): Promise<AgentInfo[]> {
+  const listed = await allAgents($)
+  const now = await $.clock.now()
+  const known = new Set(listed.map(a => a.id))
+  const unlisted = [...lastSeen].filter(([id, at]) => !known.has(id) && now - at < UNLISTED_LIVE_MS).map(([id]) => ({ id, description: nameOf(id), type: 'agent', status: 'running' }) as AgentInfo)
+  return [...listed.filter(a => LIVE_AGENT.has(a.status)), ...unlisted]
+}
+
+async function mtimeOf($: EngineInterface, path: string): Promise<number> {
+  try {
+    return (await $.fs.stat(path)).mtimeMs
+  } catch {
+    return -1
+  }
+}
+
+async function onMain($: EngineInterface, paths: string[]): Promise<string[]> {
+  const t = await get($)
+  const roots = t.top && paths.length ? await worktreeRoots($) : []
+  return paths.map(p => ontoMain(t.top, roots, posix(p)))
+}
+
 async function detectRepo($: EngineInterface): Promise<void> {
   const t = await get($)
   if (!t.root) return
@@ -277,7 +466,7 @@ async function readGit($: EngineInterface): Promise<void> {
 
 function refreshGit($: EngineInterface): Promise<void> {
   if (!gitRun) {
-    gitRun = readGit($).finally(() => {
+    gitRun = readGit($).then(() => revealChanges($)).finally(() => {
       gitRun = null
     })
     return gitRun
@@ -290,6 +479,76 @@ function refreshGit($: EngineInterface): Promise<void> {
   return gitNext
 }
 
+// After git moves: the changes tab loads the folders down to every changed file, the graph tab reads the log again.
+async function revealChanges($: EngineInterface): Promise<void> {
+  const t = await get($)
+  if (t.tab === 'changes') await revealPaths($, Object.keys(t.git))
+  if (t.tab === 'graph') await loadGraph($)
+}
+
+async function showTab($: EngineInterface, tab: FileTree['tab']): Promise<void> {
+  await patch($, () => ({ tab, scroll: null }))
+  await revealChanges($)
+}
+
+async function loadGraph($: EngineInterface): Promise<void> {
+  const t = await get($)
+  if (!t.top) {
+    graph = { top: '', rows: [], remotes: [] }
+    return
+  }
+  const [log, remotes] = await Promise.all([
+    git($, t.top, ['log', '--all', '--topo-order', '--decorate=short', `--format=${LOG_FORMAT}`, '-n', String(GRAPH_LIMIT)], 10_000).catch(() => null),
+    git($, t.top, ['remote'], 5_000).catch(() => null),
+  ])
+  await worktreeRoots($)
+  graph = { top: t.top, rows: log?.exitCode === 0 ? layout(parseLog(log.stdout)) : [], remotes: remotes?.exitCode === 0 ? remotes.stdout.split('\n').filter(Boolean) : [] }
+  if (!graph.rows.some(r => r.hash && r.hash === graphCursor)) graphCursor = graph.rows.find(r => r.hash)?.hash ?? ''
+  void $.ui.invalidate('ui.render')
+}
+
+function moveGraph($: EngineInterface, by: number): void {
+  const commits = graph.rows.filter(r => r.hash)
+  if (commits.length === 0) return
+  const at = Math.max(0, commits.findIndex(r => r.hash === graphCursor))
+  graphCursor = commits[Math.max(0, Math.min(commits.length - 1, at + by))]?.hash ?? graphCursor
+  const row = graph.rows.findIndex(r => r.hash === graphCursor)
+  if (row < graphTop) graphTop = row
+  else if (row >= graphTop + graphRoom) graphTop = row - graphRoom + 1
+  void $.ui.invalidate('ui.render')
+}
+
+async function graphKey($: EngineInterface, key: string): Promise<void> {
+  const by: Record<string, number> = { up: -1, w: -1, down: 1, s: 1, pageup: -10, pagedown: 10, home: -Infinity, end: Infinity }
+  if (key in by) moveGraph($, by[key] ?? 0)
+  else if ((key === 'return' || key === 'o' || key === 'd' || key === 'right') && graphCursor) await showCommit($, graphCursor)
+}
+
+async function pressCommit($: EngineInterface, hash: string): Promise<void> {
+  const now = await $.clock.now()
+  const isDouble = lastPress.key === `#commit:${hash}` && now - lastPress.at < DOUBLE_MS
+  lastPress = { key: isDouble ? '' : `#commit:${hash}`, at: now }
+  graphCursor = hash
+  if (isDouble) await showCommit($, hash)
+  else void $.ui.invalidate('ui.render')
+}
+
+// A commit opens in the peek: its whole diff, file by file.
+async function showCommit($: EngineInterface, hash: string): Promise<void> {
+  const t = await get($)
+  const run = t.top ? await git($, t.top, ['show', '--no-color', '--no-ext-diff', '--format=%h %s', hash], 10_000).catch(() => null) : null
+  if (!run || run.exitCode !== 0) {
+    $.ui.toast(`could not show commit ${hash}`)
+    return
+  }
+  // ponytail: a commit past 20k diff lines shows its first 20k
+  const lines = diffLines(run.stdout).slice(0, 20_000)
+  peekTop = 0
+  peekLeft = 0
+  peek = { path: run.stdout.split('\n')[0] || hash, lines, text: [], note: lines.length ? '' : 'no file changes', commit: true }
+  void $.ui.invalidate('ui.render')
+}
+
 async function reset($: EngineInterface, root: string, focus = false): Promise<void> {
   const prev = await get($)
   generation += 1
@@ -299,7 +558,7 @@ async function reset($: EngineInterface, root: string, focus = false): Promise<v
   searchIndex = null
   sizeEpoch += 1
   sizeQueue = []
-  await put($, () => ({ ...emptyTree(root), showHidden: prev.showHidden, showSize: prev.root ? prev.showSize : sizeDefault }))
+  await put($, () => ({ ...emptyTree(root), showHidden: prev.showHidden, showSize: prev.root ? prev.showSize : sizeDefault, tab: prev.tab }))
   const title = `Files: ${root.split('/').pop() || root}`
   if (focus) await $.ui.open({ id: PANE, title, focus: true })
   else if (!noDock) await $.ui.open({ id: PANE, title })
@@ -533,7 +792,7 @@ async function followCwd($: EngineInterface): Promise<boolean> {
 }
 
 type Pending = { actions: GitAction[]; ids: number[]; command: string; head: string }
-type Job = { actions: GitAction[]; since: Since; initRepo: boolean; readOnly: boolean }
+type Job = { actions: GitAction[]; since: Since; initRepo: boolean; readOnly: boolean; worktrees?: string[]; agentId?: string; endMs?: number }
 type Background = { p: Pending | null; job: Job; reads: string[] }
 type GitOperation = NonNullable<BuiltinToolResults['Bash']['gitOperation']>
 type Outcome = { state: 'done' | 'failed'; label: string; detail: string }
@@ -663,6 +922,14 @@ async function gitDir($: EngineInterface, cwd: string): Promise<string> {
   return ''
 }
 
+async function pollGit($: EngineInterface): Promise<void> {
+  const t = await get($)
+  const gd = t.top ? await gitDir($, t.top) : ''
+  const stamp = gd ? `${gd} ${(await Promise.all(['index', 'HEAD'].map(f => mtimeOf($, join(gd, f))))).join()}` : ''
+  if (gitStamp && stamp && stamp.split(' ')[0] === gitStamp.split(' ')[0] && stamp !== gitStamp) void sync($, true)
+  gitStamp = stamp
+}
+
 async function sync($: EngineInterface, force = false): Promise<void> {
   const now = await $.clock.now()
   if (!force && now - lastSync < 2_000) return
@@ -691,7 +958,7 @@ async function exists($: EngineInterface, path: string): Promise<boolean> {
 }
 
 async function afterBash($: EngineInterface, jobs: Job[]): Promise<void> {
-  const reads = queuedReads
+  const reads = await onMain($, queuedReads)
   queuedReads = []
   if (await followCwd($)) return
   const t = await get($)
@@ -716,7 +983,26 @@ async function afterBash($: EngineInterface, jobs: Job[]): Promise<void> {
     const found = fresh.top
       ? await changedInRepo($, t.root, since, before, fresh.ignored)
       : { hits: since.os === 'win32' ? [] : await changedSince($, t.root, since, NO_REPO_DEPTH), gone: [] }
+    const owned: [string | undefined, string[]][] = []
+    if (since.os !== 'win32')
+      for (const j of jobs)
+        for (const w of j.worktrees ?? []) {
+          const own = await onMain($, await changedSince($, w, since, 0))
+          owned.push([j.agentId, own])
+          found.hits.push(...own)
+        }
+    found.hits = await onMain($, found.hits)
     const hits = found.hits.filter(x => inside(t.root, x) && !underAny(x, ignored, t.root)).slice(0, FIND_LIMIT)
+    // A worktree belongs to the job that named it; the shared tree's changes go to its writer only when one agent wrote.
+    for (const [agentId, own] of owned) mark($, agentId, own.filter(x => hits.includes(x)), true)
+    const authors = [...new Set(writers.map(j => j.agentId))]
+    if (authors.length === 1) mark($, authors[0], hits, true)
+    else if (authors.length > 1)
+      // Several agents wrote at once: a file goes to the one whose command was running when it changed.
+      for (const h of hits) {
+        const who = writerAt(await mtimeOf($, h), writers.map(j => ({ agentId: j.agentId, from: j.since.ms, to: j.endMs })), MTIME_SLACK_MS)
+        if (who) mark($, who, [h], true)
+      }
     await revealPaths($, hits)
     const loaded = await get($)
     const dirs = [...new Set([loaded.root, ...openDirs(loaded), ...hits.map(dirname), ...found.gone.map(dirname)])].filter(d => inside(loaded.root, d))
@@ -778,8 +1064,12 @@ function scheduleScan($: EngineInterface, job: Job): void {
   })
 }
 
-async function touched($: EngineInterface, paths: string[], tone: string, show: boolean): Promise<void> {
+async function touched($: EngineInterface, given: string[], tone: string, show: boolean, agentId?: string): Promise<void> {
+  void noteWorktree($, agentId, given)
+  const paths = await onMain($, given)
+  mark($, agentId, paths, tone !== 'purple')
   if (tone !== 'purple' && previewed && paths.map(posix).includes(previewed.path)) previewed = null
+  if (tone !== 'purple' && peek && paths.map(posix).includes(peek.path)) void loadPeek($, peek.path, peek.agent).then(() => $.ui.invalidate('ui.render'))
   if (await followCwd($)) return
   const t = await get($)
   if (!t.root) return
@@ -806,6 +1096,89 @@ async function reveal($: EngineInterface, paths: string[]): Promise<void> {
     for (const p of paths) for (const a of ancestorsOf(p, cur.root)) open.add(a)
     return { expanded: [...open], cursor: paths[paths.length - 1] ?? cur.cursor, scroll: null }
   })
+}
+
+async function kindOf($: EngineInterface, path: string): Promise<'dir' | 'file' | ''> {
+  try {
+    return (await $.fs.stat(path)).kind === 'dir' ? 'dir' : 'file'
+  } catch {
+    return ''
+  }
+}
+
+// The prompt's box changed: the latest box is followed, the ones typed past while a lookup ran are skipped.
+function followPrompt($: EngineInterface, box: { text: string; cursor: number }): void {
+  promptBox = box
+  promptRun ??= (async () => {
+    while (promptBox) {
+      const b = promptBox
+      promptBox = null
+      await promptPath($, b.text, b.cursor).catch(() => undefined)
+    }
+  })().finally(() => {
+    promptRun = null
+    if (promptBox) followPrompt($, promptBox)
+  })
+}
+
+// While the cursor sits in a path typed at the prompt, the tree opens down to it: the file or folder
+// itself, the files its last segment begins, or the nearest folder that exists when nothing does.
+// Leaving the path puts the tree back as it was.
+async function promptPath($: EngineInterface, text: string, cursor: number): Promise<void> {
+  const typed = pathAt(text, cursor)
+  const t = await get($)
+  if (!typed || !t.root) return endPromptPath($)
+  const target = resolve(t.root, typed, home).replace(/(.)\/+$/, '$1')
+  let state: NonNullable<typeof promptHint>['state'] = 'outside'
+  let matches = 0
+  let at = ''
+  let kind = await kindOf($, target)
+  if (!inside(t.root, target)) state = 'outside'
+  else if (kind) {
+    state = 'found'
+    at = target
+  } else {
+    const parent = typed.endsWith('/') ? target : dirname(target)
+    const base = typed.endsWith('/') ? '' : (target.split('/').pop() ?? '').toLowerCase()
+    const kids = base && inside(t.root, parent) && (await kindOf($, parent)) === 'dir' ? ((await list($, parent)) ?? []) : []
+    const hits = kids.filter(n => n.name.toLowerCase().startsWith(base))
+    if (hits[0]) {
+      state = 'partial'
+      matches = hits.length
+      at = hits[0].id
+      kind = hits[0].kind === 'dir' ? 'dir' : 'file'
+    } else {
+      state = 'missing'
+      for (let dir = parent; inside(t.root, dir); dir = dirname(dir)) {
+        if ((await kindOf($, dir)) === 'dir') {
+          at = dir
+          kind = 'dir'
+          break
+        }
+        if (dir === t.root) break
+      }
+    }
+  }
+  promptHint = { typed, state, matches }
+  promptSnap ??= { expanded: t.expanded, cursor: t.cursor, scroll: t.scroll, tab: t.tab }
+  const snap = promptSnap
+  if (at && at !== t.root) {
+    await revealPaths($, [at])
+    if (kind === 'dir' && state === 'found') await loadDirs($, [at])
+  }
+  const open = new Set(snap.expanded)
+  if (at && at !== t.root) for (const a of [...ancestorsOf(at, t.root), ...(kind === 'dir' && state === 'found' ? [at] : [])]) open.add(a)
+  await patch($, () => ({ expanded: [...open], cursor: at && at !== t.root ? at : snap.cursor, scroll: at ? null : snap.scroll, tab: 'files' }))
+  void $.ui.invalidate('ui.render')
+}
+
+async function endPromptPath($: EngineInterface): Promise<void> {
+  const snap = promptSnap
+  promptSnap = null
+  if (!promptHint && !snap) return
+  promptHint = null
+  if (snap) await patch($, () => ({ ...snap }))
+  void $.ui.invalidate('ui.render')
 }
 
 async function walk($: EngineInterface, root: string, depth: number, limit: number): Promise<string[]> {
@@ -981,6 +1354,148 @@ function previewLines(text: string, top: number, rows: number, markdown: boolean
   return { text: shown.join('\n'), top: from }
 }
 
+// The file's diff against HEAD, on the main tree or, with `agent`, in that subagent's worktree.
+async function loadPeek($: EngineInterface, path: string, agent?: string): Promise<void> {
+  const t = await get($)
+  const wt = agent && t.top && inside(t.top, path) ? book.worktrees[agent] : undefined
+  const repo = wt ?? t.top
+  const file = wt ? join(wt, relative(t.top, path)).replace(/\/$/, '') : path
+  const untracked = wt
+    ? Boolean((await git($, wt, ['status', '--porcelain=v1', '--', file], 5_000).catch(() => null))?.stdout.startsWith('??'))
+    : (t.git[path] ?? (underAny(dirname(path), new Set(t.untrackedDirs), t.root) ? '?' : '')) === '?'
+  let lines: DiffLine[] = []
+  if (repo && !untracked) {
+    const run = await git($, repo, ['diff', 'HEAD', '--no-color', '--no-ext-diff', '--', file], 10_000).catch(() => null)
+    if (run?.exitCode === 0) lines = diffLines(run.stdout)
+  }
+  await loadPreview($, file)
+  const text = previewed?.path === file && previewed.text ? previewed.text.split('\n') : []
+  if (repo && untracked) lines = addedDiff(text)
+  peek = { path, file, lines, text, note: previewed?.note || (lines.length || !repo ? '' : 'no changes'), ...(wt && agent ? { agent } : {}) }
+}
+
+// The subagents with a worktree that touched the peeked file: `t` steps from the main tree through them.
+function peekSources(path: string): string[] {
+  return Object.keys(book.worktrees).filter(id => touchedBy(id).includes(path))
+}
+
+async function cyclePeek($: EngineInterface): Promise<void> {
+  if (!peek || peek.commit || editing) return
+  const order = [undefined, ...peekSources(peek.path)]
+  const next = order[(order.indexOf(peek.agent) + 1) % order.length]
+  peekTop = 0
+  await loadPeek($, peek.path, next)
+  void $.ui.invalidate('ui.render')
+}
+
+function jumpHunk($: EngineInterface, by: 1 | -1): void {
+  if (!peek?.lines.length) return
+  const starts = hunkStarts(peek.lines)
+  const to = by > 0 ? starts.find(i => i > peekTop) : [...starts].reverse().find(i => i < peekTop)
+  if (to === undefined) return
+  // Not clamped: the last hunk may start below the last full window, and the next p steps back from it.
+  peekTop = to
+  void $.ui.invalidate('ui.render')
+}
+
+async function showPeek($: EngineInterface, path: string): Promise<void> {
+  editing = null
+  peekTop = 0
+  peekLeft = 0
+  await loadPeek($, path)
+  await patch($, () => ({ selected: path }))
+  void $.ui.invalidate('ui.render')
+}
+
+function scrollPeek($: EngineInterface, by: number, sideways = 0): void {
+  if (!peek) return
+  const last = Math.max(0, (peek.lines.length || peek.text.length) - (peekBody - 1))
+  const widest = Math.max(0, ...(peek.lines.length ? peek.lines.map(l => l.text.length - 1) : peek.text.map(l => l.length)))
+  peekTop = Math.max(0, Math.min(last, peekTop + by))
+  peekLeft = Math.max(0, Math.min(Math.max(0, widest - 8), peekLeft + sideways))
+  void $.ui.invalidate('ui.render')
+}
+
+function closePeek($: EngineInterface): void {
+  if (!leaveEdit($)) return
+  peek = null
+  void $.ui.invalidate('ui.render')
+}
+
+function editDirty(): boolean {
+  return Boolean(editing && editing.draft !== editing.original)
+}
+
+// Leaving the editor with something typed and not saved takes a second try.
+function leaveEdit($: EngineInterface): boolean {
+  if (editing && editDirty() && editing.armed !== 'leave') {
+    editing.armed = 'leave'
+    $.ui.toast('Unsaved changes: save them, or press again to discard them')
+    void $.ui.invalidate('ui.render')
+    return false
+  }
+  editing = null
+  void $.ui.invalidate('ui.render')
+  return true
+}
+
+// The peeked file, whole and as it is on disk, in a field to type in.
+async function startEdit($: EngineInterface): Promise<void> {
+  if (!peek?.file || peek.commit) return
+  const file = peek.file
+  try {
+    const st = await $.fs.stat(file)
+    if (st.kind !== 'file') throw new Error('not a file')
+    if (st.size > EDIT_MAX_BYTES) throw new Error(`${formatSize(st.size)}, too large to edit here`)
+    const raw = String(await $.fs.read(file))
+    if (raw.includes('\0')) throw new Error('binary file')
+    const crlf = raw.includes('\r\n')
+    const text = crlf ? raw.replace(/\r\n/g, '\n') : raw
+    editing = { file, original: text, draft: text, crlf, mtimeMs: st.mtimeMs, armed: '' }
+  } catch (err) {
+    $.ui.toast(`Cannot edit ${shortPath(file)}: ${String((err as Error)?.message ?? err).split('\n')[0]}`)
+    return
+  }
+  void $.ui.invalidate('ui.render')
+  $.clock.after(100, () => void $.ui.focus({ requestId: PANE, key: 'peek-edit' }).catch(() => {}))
+}
+
+function typed($: EngineInterface, value: string): void {
+  if (!editing) return
+  const was = editDirty()
+  editing.draft = value
+  editing.armed = ''
+  if (editDirty() !== was) void $.ui.invalidate('ui.render')
+}
+
+// Writes what was typed, in the file's own line ending. A file changed on disk since it was opened
+// (an agent's edit) is not overwritten on the first try.
+async function saveEdit($: EngineInterface, value?: string): Promise<void> {
+  if (!editing) return
+  if (value !== undefined) editing.draft = value
+  const e = editing
+  if (!editDirty()) return
+  const now = await mtimeOf($, e.file)
+  if (now !== e.mtimeMs && e.armed !== 'save') {
+    e.armed = 'save'
+    $.ui.toast(`${shortPath(e.file)} changed on disk since you opened it: save again to overwrite it`)
+    return
+  }
+  try {
+    await $.fs.write(e.file, e.crlf ? e.draft.replace(/\n/g, '\r\n') : e.draft)
+  } catch (err) {
+    $.ui.toast(`Could not save ${shortPath(e.file)}: ${String((err as Error)?.message ?? err).split('\n')[0]}`)
+    return
+  }
+  e.original = e.draft
+  e.armed = ''
+  e.mtimeMs = await mtimeOf($, e.file)
+  $.ui.toast(`Saved ${shortPath(e.file)}`)
+  if (peek) await loadPeek($, peek.path, peek.agent)
+  await refreshGit($)
+  void $.ui.invalidate('ui.render')
+}
+
 async function openFile($: EngineInterface, path: string, how: { mode?: string; line?: number } = {}): Promise<void> {
   const mode = (how.mode ?? openWithSetting).trim()
   if (mode === 'preview') return showPreview($, path)
@@ -1030,7 +1545,8 @@ async function press($: EngineInterface, n: FileNode): Promise<void> {
     await toggle($, n)
     return
   }
-  await openNode($, n)
+  if (n.kind === 'dir') await openNode($, n)
+  else await showPeek($, n.id)
 }
 
 async function openNode($: EngineInterface, n: FileNode): Promise<void> {
@@ -1049,19 +1565,159 @@ async function navigate($: EngineInterface, key: string, shift = false, surface?
     const target = rows[Math.max(0, Math.min(rows.length - 1, (at < 0 ? 0 : at) + d))]
     return target ? patch($, () => ({ cursor: target.node.id, scroll: null })) : Promise.resolve()
   }
-  if (key === 'up' || key === 'k') await move(-1)
-  else if (key === 'down' || key === 'j') await move(1)
+  if (key === 'up' || key === 'w') await move(-1)
+  else if (key === 'down' || key === 's') await move(1)
   else if (key === 'pageup') await move(-10)
   else if (key === 'pagedown') await move(10)
   else if (key === 'home') await move(-rows.length)
   else if (key === 'end') await move(rows.length)
   else if (cur && (key === 'y' || key === 'Y')) await copyPath($, cur.id, key === 'Y' || shift, surface)
-  else if (cur && (key === 'right' || key === 'l') && cur.kind === 'dir' && !t.expanded.includes(cur.id)) await toggle($, cur)
-  else if (cur && (key === 'left' || key === 'h')) {
+  else if (cur && (key === 'right' || key === 'd') && cur.kind === 'dir' && !t.expanded.includes(cur.id)) await toggle($, cur)
+  else if (cur && (key === 'left' || key === 'a')) {
     if (cur.kind === 'dir' && t.expanded.includes(cur.id)) await toggle($, cur)
     else if (cur.parent !== t.root) await patch($, () => ({ cursor: cur.parent }))
   } else if (cur && key === 'return') await (cur.kind !== 'dir' ? openNode($, cur) : toggle($, cur))
   else if (cur && (key === ' ' || key === 'space')) await (cur.kind !== 'dir' && (await osName($)) === 'darwin' ? quickLook($, cur.id) : toggle($, cur))
+}
+
+// Tab 4: every subagent this session, parents before children, live ones first; an open one lists its files.
+async function agentRows($: EngineInterface, viewing: string | undefined): Promise<{ id: string; agent: string; path?: string; write?: boolean; depth: number; live: boolean }[]> {
+  const listed = await allAgents($)
+  const live = new Set((await liveAgents($)).map(a => a.id))
+  const known = new Set(listed.map(a => a.id))
+  const all = [...listed, ...Object.keys(book.colors).filter(id => !known.has(id)).map(id => ({ id, description: nameOf(id), type: 'agent', status: live.has(id) ? 'running' : 'completed' }) as AgentInfo)]
+  const shown = all.filter(a => (a.id in book.colors || live.has(a.id)) && seenFrom(all, viewing, a.id))
+  const ordered = byLineage(shown).sort((x, y) => Number(live.has(y.agent.id)) - Number(live.has(x.agent.id)))
+  return ordered.flatMap(({ agent: a, depth }) => [
+    { id: `#agent:${a.id}`, agent: a.id, depth, live: live.has(a.id) },
+    ...(agentOpen.has(a.id)
+      ? [...(book.writes[a.id] ?? []).map(p => ({ path: p, write: true })), ...(book.reads[a.id] ?? []).filter(p => !book.writes[a.id]?.includes(p)).map(p => ({ path: p, write: false }))].map(f => ({
+          id: `#afile:${a.id}|${f.path}`,
+          agent: a.id,
+          path: f.path,
+          write: f.write,
+          depth,
+          live: live.has(a.id),
+        }))
+      : []),
+  ])
+}
+
+async function agentKey($: EngineInterface, key: string, viewing: string | undefined): Promise<void> {
+  const rows = await agentRows($, viewing)
+  const at = Math.max(0, rows.findIndex(r => r.id === agentCursor))
+  const cur = rows[at]
+  const by: Record<string, number> = { up: -1, w: -1, down: 1, s: 1, pageup: -10, pagedown: 10, home: -Infinity, end: Infinity }
+  if (key in by) {
+    const to = Math.max(0, Math.min(rows.length - 1, at + (by[key] ?? 0)))
+    agentCursor = rows[to]?.id ?? agentCursor
+    if (to < agentTop) agentTop = to
+    else if (to >= agentTop + agentRoom) agentTop = to - agentRoom + 1
+  }
+  else if (cur && (key === 'right' || key === 'd')) agentOpen.add(cur.agent)
+  else if (cur && (key === 'left' || key === 'a')) {
+    agentOpen.delete(cur.agent)
+    agentCursor = `#agent:${cur.agent}`
+  } else if (cur && (key === 'return' || key === 'o')) return pressAgentRow($, cur.id)
+  void $.ui.invalidate('ui.render')
+}
+
+async function pressAgentRow($: EngineInterface, id: string): Promise<void> {
+  agentCursor = id
+  if (id.startsWith('#agent:')) {
+    const agent = id.slice('#agent:'.length)
+    agentOpen.has(agent) ? agentOpen.delete(agent) : agentOpen.add(agent)
+    void $.ui.invalidate('ui.render')
+  } else await showPeek($, id.slice(id.indexOf('|') + 1))
+}
+
+// Where a new file goes: the folder under the cursor, else the selected file's folder, else the root.
+function newDir(t: FileTree): string {
+  const cur = t.nodes.find(n => n.id === t.cursor)
+  const dir = cur?.kind === 'dir' ? cur.id : t.selected ? dirname(t.selected) : t.root
+  return inside(t.root, dir) ? dir : t.root
+}
+
+async function startNew($: EngineInterface): Promise<void> {
+  fileAct = { kind: 'new', dir: newDir(await get($)), name: '' }
+  void $.ui.invalidate('ui.render')
+  $.clock.after(100, () => void $.ui.focus({ requestId: PANE, key: 'new-name' }).catch(() => {}))
+}
+
+function cancelAct($: EngineInterface): void {
+  fileAct = null
+  void $.ui.invalidate('ui.render')
+}
+
+// Creates the file named (a trailing / makes a folder; folders on the way are made too), inside the tree only.
+async function createNew($: EngineInterface, value?: string): Promise<void> {
+  if (fileAct?.kind !== 'new') return
+  const t = await get($)
+  const name = (value ?? fileAct.name).trim()
+  const folder = name.endsWith('/')
+  const path = resolve(fileAct.dir, name, '').replace(/\/+$/, '')
+  if (!name || !inside(t.root, path) || path === t.root) {
+    $.ui.toast(name ? `${name} is outside this tree` : 'Type a name first')
+    return
+  }
+  if (await exists($, path)) {
+    $.ui.toast(`${relative(t.root, path)} already exists`)
+    return
+  }
+  if ((await osName($)) === 'win32') {
+    $.ui.toast('Creating files from the tree is not supported on Windows yet')
+    return
+  }
+  try {
+    const dir = folder ? path : dirname(path)
+    if (dir !== t.root && !(await exists($, dir))) {
+      const run = await $.process.run(['mkdir', '-p', '--', dir], { timeoutMs: 5_000 })
+      if (run.exitCode !== 0) throw new Error(run.stderr.trim() || `mkdir exit ${run.exitCode}`)
+    }
+    if (!folder) await $.fs.write(path, '')
+  } catch (err) {
+    $.ui.toast(`Could not create ${relative(t.root, path)}: ${String((err as Error)?.message ?? err).split('\n')[0]}`)
+    return
+  }
+  fileAct = null
+  searchIndex = null
+  await revealPaths($, [path])
+  await loadDirs($, [...new Set([dirname(path), ...ancestorsOf(path, t.root)])].filter(d => inside(t.root, d)))
+  await patch($, cur => {
+    const open = new Set(cur.expanded)
+    for (const a of ancestorsOf(path, cur.root)) open.add(a)
+    return { expanded: [...open], cursor: path, scroll: null, ...(folder ? {} : { selected: path }) }
+  })
+  await refreshGit($)
+  $.ui.toast(`Created ${relative(t.root, path)}${folder ? '/' : ''}`)
+}
+
+// Deletes the selected file, never a folder or anything outside the tree; the footer asks first.
+async function deleteFile($: EngineInterface, path: string): Promise<void> {
+  const t = await get($)
+  fileAct = null
+  if (!inside(t.root, path) || path === t.root || (await kindOf($, path)) !== 'file') {
+    $.ui.toast('Only a file in this tree can be deleted here')
+    return
+  }
+  if ((await osName($)) === 'win32') {
+    $.ui.toast('Deleting files from the tree is not supported on Windows yet')
+    return
+  }
+  const run = await $.process.run(['rm', '-f', '--', path], { timeoutMs: 5_000 }).catch(err => ({ exitCode: 1, stderr: String(err) }))
+  if (run.exitCode !== 0) {
+    $.ui.toast(`Could not delete ${relative(t.root, path)}: ${run.stderr.trim().split('\n')[0]}`)
+    return
+  }
+  if (peek?.path === path) {
+    peek = null
+    editing = null
+  }
+  searchIndex = null
+  await patch($, cur => ({ selected: cur.selected === path ? '' : cur.selected, cursor: cur.cursor === path ? dirname(path) : cur.cursor }))
+  await loadDirs($, [dirname(path)])
+  await refreshGit($)
+  $.ui.toast(`Deleted ${relative(t.root, path)}`)
 }
 
 async function loadTheme($: EngineInterface): Promise<void> {
@@ -1124,6 +1780,11 @@ export const register: Register = (on, options) => {
     inTmux = !windows && Boolean(await $.env.get('TMUX'))
     home = posix(((await $.env.get('HOME')) || (await $.env.get('USERPROFILE')) || '').replace(/[\\/]+$/, ''))
     activityId = Math.max(activityId, ...(await activities($)).map(a => a.id))
+    await loadBook($)
+    // ponytail: .git/index and HEAD are polled because a SessionStart hook ahead of ours can keep the
+    // watchPaths below from ever being registered; the FileChanged path stays for when they are.
+    gitPoll?.cancel()
+    gitPoll = $.clock.every(GIT_POLL_MS, () => void pollGit($))
     void (async () => {
       pointer = await finePointerOk($)
       try {
@@ -1171,6 +1832,14 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', async ($, e, next) => {
+    if (e.agentId) {
+      const at = await $.clock.now()
+      lastSeen.set(e.agentId, at)
+      book.last[e.agentId] = { text: lastCall(e as unknown as { tool: string } & Record<string, unknown>), at }
+      colorOf(e.agentId)
+      saveBook($)
+      if (!book.names[e.agentId]) void allAgents($)
+    }
     const shell = e.tool === 'Bash' || e.tool === 'PowerShell'
     if (e.tool !== 'Edit' && e.tool !== 'Write' && e.tool !== 'NotebookEdit' && !shell) return next(e)
     const command = e.tool === 'Bash' || e.tool === 'PowerShell' ? e.command : ''
@@ -1200,11 +1869,19 @@ export const register: Register = (on, options) => {
     if (shell) {
       const out: Partial<BuiltinToolResults['Bash']> = !result.isError && result.result && typeof result.result === 'object' ? (result.result as Partial<BuiltinToolResults['Bash']>) : {}
       const reads = showReads ? readTargets(command, cwd, typeof out.stdout === 'string' ? out.stdout : '', home) : []
-      const job: Job = { actions: [], since, initRepo: actions.some(a => a.init), readOnly: quiet || result.isReadOnly === true }
+      // ponytail: a worktree is scanned when the command names its absolute path (the usual `cd <worktree> && ...`)
+      const worktrees = quiet ? [] : (await worktreeRoots($)).filter(w => command.includes(w))
+      const job: Job = { actions: [], since, initRepo: actions.some(a => a.init), readOnly: quiet || result.isReadOnly === true, worktrees, agentId: e.agentId, endMs: await $.clock.now() }
+      mark($, e.agentId, await onMain($, reads))
+      if (e.agentId && worktrees[0]) void noteWorktree($, e.agentId, worktrees)
       if (out.backgroundTaskId) background.set(out.backgroundTaskId, { p: pending, job, reads })
       else void (async () => {
         const results = pending ? await outcomes($, pending, !result.isError, out.gitOperation) : []
         if (pending) await finishGit($, pending, results)
+        // A subagent's commit takes its color in the graph.
+        for (const [i, a] of (pending?.actions ?? []).entries())
+          if (e.agentId && a.verb === 'commit' && results[i]?.state === 'done' && results[i]?.detail) book.commits[results[i]?.detail ?? ''] = e.agentId
+        if (e.agentId && results.length) saveBook($)
         queuedReads.push(...reads)
         scheduleScan($, { ...job, actions: proven(pending, results) })
       })()
@@ -1216,7 +1893,7 @@ export const register: Register = (on, options) => {
           : 'notebook_path' in e && typeof e.notebook_path === 'string'
             ? e.notebook_path
             : ''
-      if (file) void touched($, [file], 'orange', showWrites)
+      if (file) void touched($, [file], 'orange', showWrites, e.agentId)
     }
     return result
   })
@@ -1224,7 +1901,7 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'Read' }, async ($, e, next) => {
     const result = await next(e)
     if (result.deny || result.isError || e.tool !== 'Read' || !showReads) return result
-    void touched($, [posix(e.file_path)], 'purple', true)
+    void touched($, [posix(e.file_path)], 'purple', true, e.agentId)
     return result
   })
 
@@ -1235,7 +1912,7 @@ export const register: Register = (on, options) => {
       const names = (result.result as Partial<BuiltinToolResults['Grep']> | undefined)?.filenames
       if (!Array.isArray(names) || names.length === 0) return result
       const cwd = await cwdOf($)
-      void touched($, names.slice(0, SEARCH_REVEAL_LIMIT).map(f => resolve(cwd, posix(f), home)), 'purple', true)
+      void touched($, names.slice(0, SEARCH_REVEAL_LIMIT).map(f => resolve(cwd, posix(f), home)), 'purple', true, e.agentId)
       return result
     })
 
@@ -1255,12 +1932,21 @@ export const register: Register = (on, options) => {
     void sync($)
     const t = await get($)
     if (typeof data.copy === 'string') {
-      await copyPath($, data.copy, Boolean(data.shift), e.surface)
+      if (data.copy.startsWith('#afile:')) await copyPath($, data.copy.slice(data.copy.indexOf('|') + 1), Boolean(data.shift), e.surface)
+      else if (!data.copy.startsWith('#')) await copyPath($, data.copy, Boolean(data.shift), e.surface)
       return {}
     }
     if (typeof data.scrollTo === 'number') {
       const to = Math.round(Math.max(0, Math.min(1, data.scrollTo)) * view.max)
       if (to !== t.scroll) await patch($, () => ({ scroll: to }))
+      return {}
+    }
+    if (typeof data.press === 'string' && data.press.startsWith('#commit:')) {
+      await pressCommit($, data.press.slice('#commit:'.length))
+      return {}
+    }
+    if (typeof data.press === 'string' && (data.press.startsWith('#agent:') || data.press.startsWith('#afile:'))) {
+      await pressAgentRow($, data.press)
       return {}
     }
     if (typeof data.press === 'string') {
@@ -1274,14 +1960,80 @@ export const register: Register = (on, options) => {
     if (typeof data.key !== 'string') return {}
     if (t.preview) {
       const page = Math.max(1, previewRows - 2)
-      const by: Record<string, number> = { up: -1, k: -1, down: 1, j: 1, f: page, b: -page, pageup: -page, pagedown: page, home: -Infinity, end: Infinity }
-      if (data.key === 'left' || data.key === 'h') await closePreview($)
+      const by: Record<string, number> = { up: -1, w: -1, down: 1, s: 1, f: page, b: -page, pageup: -page, pagedown: page, home: -Infinity, end: Infinity }
+      if (data.key === 'left' || data.key === 'a') await closePreview($)
       else if (data.key === 'e') await editPreview($, t.preview)
       else if (data.key in by) await scrollPreview($, by[data.key] ?? 0)
       return {}
     }
-    await navigate($, data.key, Boolean(data.shift), e.surface)
+    if (t.tab === 'graph' && t.top) await graphKey($, data.key)
+    else if (t.tab === 'agents') await agentKey($, data.key, agentView)
+    else await navigate($, data.key, Boolean(data.shift), e.surface)
     return {}
+  })
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const rest = await next(e)
+    if (e.props.hasSurvey) return rest
+    const agents = await liveAgents($)
+    if (agents.length === 0) return rest
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const viewing = e.props.view?.agentId
+    return (
+      <Box flexDirection="column">
+        <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+          {byLineage(agents).map(({ agent: a, depth }) => {
+            const label = a.name || a.description || a.type
+            return (
+              <Box key={`agent-${a.id}`} flexDirection="row">
+                {depth > 0 && <Text dimColor>↳ </Text>}
+                <Text color={colorOf(a.id)}>{viewing === a.id ? '◉ ' : '● '}</Text>
+                <Button
+                  key={`agent-open-${a.id}`}
+                  plain
+                  dimColor={Boolean(viewing) && viewing !== a.id}
+                  label={label.length > 32 ? `${label.slice(0, 31)}…` : label}
+                  onPress={() => void $.ui.view(viewing === a.id ? {} : { agentId: a.id })}
+                />
+              </Box>
+            )
+          })}
+        </Box>
+        {rest}
+      </Box>
+    )
+  })
+
+  // The transcript's Agent row gets the agent's dot, the same color as its chip and its files.
+  on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
+    const row = await next(e)
+    if (e.props.tool !== 'Agent') return row
+    const out = e.props.output as { agentId?: unknown } | undefined
+    const description = (e.props.input as { description?: unknown } | undefined)?.description
+    const id = typeof out?.agentId === 'string' ? out.agentId : (await $.agent.list().catch(() => [] as AgentInfo[])).filter(a => a.description === description).pop()?.id
+    if (!id) return row
+    const { Box, Text } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="row">
+        <Text color={colorOf(id)}>● </Text>
+        <Box flexGrow={1} flexDirection="column">
+          {row}
+        </Box>
+      </Box>
+    )
+  })
+
+  on('agent.spawn', async ($, e, next) => {
+    const result = await next(e)
+    void $.ui.invalidate('ui.render')
+    return result
+  })
+
+  // A subagent's answer ends its run; its status settles just after, so redraw then.
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId) $.clock.after(500, () => void $.ui.invalidate('ui.render'))
+    return result
   })
 
   on('classic.SessionStart', async ($, e, next) => {
@@ -1318,9 +2070,23 @@ export const register: Register = (on, options) => {
 
   on('ui.scroll', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
     if (nativeScroll) return next(e)
+    if (peek) {
+      scrollPeek($, Math.sign(e.by) * Math.max(3, Math.abs(e.by)))
+      return {}
+    }
     const t = await get($)
     if (t.preview) {
       await scrollPreview($, Math.sign(e.by) * Math.max(3, Math.abs(e.by)))
+      return {}
+    }
+    if (t.tab === 'agents') {
+      agentTop = Math.max(0, agentTop + Math.sign(e.by) * Math.max(3, Math.abs(e.by)))
+      void $.ui.invalidate('ui.render')
+      return {}
+    }
+    if (t.tab === 'graph' && t.top) {
+      graphTop = Math.max(0, Math.min(Math.max(0, graph.rows.length - graphRoom), graphTop + Math.sign(e.by) * Math.max(3, Math.abs(e.by))))
+      void $.ui.invalidate('ui.render')
       return {}
     }
     const to = Math.max(0, Math.min(view.max, (t.scroll ?? view.from) + Math.sign(e.by) * Math.max(3, Math.abs(e.by))))
@@ -1328,8 +2094,22 @@ export const register: Register = (on, options) => {
     return {}
   })
 
+  on('prompt.edit', async ($, e, next) => {
+    const box = await next(e)
+    followPrompt($, box)
+    return box
+  })
+
+  on('prompt.change', async ($, e, next) => {
+    followPrompt($, e)
+    return next(e)
+  })
+
   on('prompt.submit', async ($, e, next) => {
     void settleBackground($, e.text)
+    promptBox = null
+    await promptRun?.catch(() => undefined)
+    await endPromptPath($)
     if (!(await followCwd($))) void sync($)
     const t = await get($)
     const context = [...(e.context ?? [])]
@@ -1370,7 +2150,7 @@ export const register: Register = (on, options) => {
       return <Empty />
     }
     const unicode = glyphSetting === 'plain' || (glyphSetting === 'auto' && (noNerd || e.surface === 'desktop'))
-    const { Box, Text, Button, Input, Client } = $.ui.resolve(e)
+    const { Box, Text, Button, Input, Client, Code } = $.ui.resolve(e)
     const t = await get($)
     const light = !themeMtime && e.surface !== 'desktop' && lightTerminal
     const theme: Theme = light ? LIGHT_THEME : ((await $.state.get(THEME)).value ?? DEFAULT_THEME)
@@ -1388,8 +2168,108 @@ export const register: Register = (on, options) => {
     const hint = (buttons: { id: string; hint: string }[], title: number) => {
       const text = buttons.find(b => b.id === hovered)?.hint
       if (!text) return null
-      const room = e.props.bodyColumns - title - buttons.length * (e.surface === 'desktop' ? 3 : 2) - 2
+      const room = e.props.bodyColumns - title - buttons.length * (e.surface === 'desktop' || !unicode ? 3 : 2) - 2
       return text.length <= room ? <Text color={theme.muted}>{`${text} `}</Text> : null
+    }
+    if (peek) {
+      const height = Math.max(6, e.props.scroll?.bodyRows ?? 40)
+      peekBody = height - 3
+      const step = Math.max(8, Math.floor(e.props.bodyColumns / 2))
+      const total = peek.lines.length || peek.text.length
+      const top = Math.max(0, Math.min(peekTop, total - (peekBody - 1)))
+      const adds = peek.lines.filter(l => l.text[0] === '+').length
+      const dels = peek.lines.filter(l => l.text[0] === '-').length
+      const name = inside(t.root, peek.path) ? relative(t.root, peek.path) : shortPath(peek.path)
+      const node = t.nodes.find(n => n.id === peek?.path)
+      const glyph = peek.commit ? '◆' : unicode || !node ? '·' : fileIcon(node, false, false)
+      const starts = peek.lines.length ? hunkStarts(peek.lines) : []
+      const hunk = starts.filter(i => i <= peekTop).length
+      const where = total ? `${starts.length > 1 ? `hunk ${Math.max(1, hunk)}/${starts.length} · ` : ''}${top + 1}–${Math.min(total, top + peekBody)} of ${total}${peekLeft ? ` · col ${peekLeft + 1}` : ''}` : ''
+      const sources = peek.commit ? [] : peekSources(peek.path)
+      const nextSource = [undefined, ...sources][([undefined, ...sources].indexOf(peek.agent) + 1) % (sources.length + 1)]
+      // The file lights here as it does in the tree, in the same tone, and carries the dots of the agents that touched it.
+      const lit = !peek.commit && t.flashOn && (t.flash.includes(peek.path) || t.flashDim.includes(peek.path))
+      const flare = { sh: t.flashTones[peek.path] ?? 'orange', dim: !t.flash.includes(peek.path) }
+      const liveNow = peek.commit ? [] : await liveAgents($)
+      const here = liveNow.filter(a => touchedBy(a.id).includes(peek?.path ?? '') && seenFrom(liveNow, e.props.view?.agentId, a.id))
+      const clash = here.filter(a => book.writes[a.id]?.includes(peek?.path ?? '')).length > 1
+      const source = peek.agent ? ` ⎇ ${nameOf(peek.agent)}` : ''
+      const room = Math.max(8, e.props.bodyColumns - 16 - here.length - String(adds).length - String(dels).length - source.length - (clash ? 2 : 0))
+      const title = name.length > room ? `…${name.slice(1 - room)}` : name
+      const titleRow: RowSpec = {
+        id: '',
+        left: clean([
+          lit ? { t: title, ...flare, b: true } : { t: title, c: theme.fg || undefined, b: true },
+          ...(here.length ? [{ t: ' ' }, ...here.slice(0, AGENT_DOTS).map(a => ({ t: '●', c: colorOf(a.id) }))] : []),
+          ...(here.length > AGENT_DOTS ? [{ t: `+${here.length - AGENT_DOTS}`, c: theme.muted }] : []),
+          ...(clash ? [{ t: ' ⚠', c: theme.urgent, b: true }] : []),
+          ...(peek.agent ? [{ t: source, c: colorOf(peek.agent), b: true }] : []),
+        ]),
+        right: [],
+      }
+      const ruleText = '─'.repeat(Math.max(1, e.props.bodyColumns))
+      const ruleRow: RowSpec = { id: '', left: [lit ? { t: ruleText, ...flare } : { t: ruleText, c: theme.muted }], right: [] }
+      const nav = [
+        ['peek-up', 'w', '↑', '\u{f005d}', 2 - peekBody, 0],
+        ['peek-down', 's', '↓', '\u{f0045}', peekBody - 2, 0],
+        ['peek-left', 'a', '←', '\u{f004d}', 0, -step],
+        ['peek-right', 'd', '→', '\u{f0054}', 0, step],
+      ] as const
+      // The file's own close sits left as "files", away from the pane's × in the top-right corner.
+      return (
+        <Box flexDirection="column" height={height} overflow="hidden" backgroundColor={theme.bg || undefined}>
+          <Box flexDirection="row" backgroundColor={rowColors.hoverBg} paddingX={1}>
+            <Button key="peek-close" plain autoFocus={editing ? undefined : true} hotkey="q" label={`${unicode ? '←' : '\u{f004d}'} ${t.tab}`} onPress={() => closePeek($)} />
+            <Text color={theme.muted}>{'  │  '}</Text>
+            <Text color={theme.accent}>{`${glyph} `}</Text>
+            <Box flexShrink={1} flexGrow={1}>
+              <Client key="peek-title" module="./rows.tsx" props={{ rows: [titleRow], active: '', ...rowColors, pointer: false } satisfies RowsProps} />
+            </Box>
+            {adds > 0 && <Text bold color={addColor}>{` +${adds}`}</Text>}
+            {dels > 0 && <Text bold color={delColor}>{` −${dels}`}</Text>}
+            {peek.note && <Text italic color={theme.muted}>{` ${peek.note}`}</Text>}
+          </Box>
+          {editing ? (
+            <Box flexDirection="row" paddingX={1} gap={2}>
+              {/* Always drawn, only its label moves: a redraw that adds or drops an element while the field
+                  has the keys hands them back to the prompt. */}
+              <Button key="peek-save" plain dimColor={!editDirty()} label={!editDirty() ? 'no changes' : editing.armed === 'save' ? '✎ save anyway' : '✎ save'} onPress={() => void saveEdit($)} />
+              <Button key="peek-done" plain dimColor label={editDirty() ? (editing.armed === 'leave' ? 'discard' : 'cancel') : 'done'} onPress={() => leaveEdit($)} />
+              <Box flexGrow={1} />
+              <Text color={theme.muted} wrap="truncate-start">{editDirty() ? 'edited · Enter saves' : 'Enter saves · Esc leaves the field'}</Text>
+            </Box>
+          ) : (
+          <Box flexDirection="row" paddingX={1} gap={2}>
+            {nav.map(([key, hotkey, plain, nerd, by, sideways]) => (
+              <Button key={key} plain dimColor hotkey={hotkey} label={unicode ? plain : `${nerd} `} onPress={() => scrollPeek($, by, sideways)} />
+            ))}
+            {starts.length > 1 && <Button key="peek-next" plain dimColor hotkey="n" label="hunk" onPress={() => jumpHunk($, 1)} />}
+            {starts.length > 1 && <Button key="peek-prev" plain dimColor hotkey="p" label="back" onPress={() => jumpHunk($, -1)} />}
+            {sources.length > 0 && <Button key="peek-source" plain dimColor hotkey="t" label={`⎇ ${nextSource ? nameOf(nextSource) : 'main'}`} onPress={() => void cyclePeek($)} />}
+            {!peek.commit && peek.file && <Button key="peek-edit-start" plain dimColor hotkey="i" label="✎ edit" onPress={() => void startEdit($)} />}
+            <Box flexGrow={1} />
+            <Text color={theme.muted}>{where}</Text>
+          </Box>
+          )}
+          <Client key="peek-rule" module="./rows.tsx" props={{ rows: [ruleRow], active: '', ...rowColors, pointer: false } satisfies RowsProps} />
+          {editing ? (
+            // The field is drawn with what it held when opened or last saved, never the draft: a new value
+            // resets it, and the keys with it.
+            <Input key="peek-edit" autoFocus rows={Math.max(2, peekBody)} value={editing.original} submitLabel="save" onInput={(v: string) => typed($, v)} onSubmit={(v: string) => void saveEdit($, v)} />
+          ) : peek.lines.length > 0 && peek.commit ? (
+            byFile(peek.lines.slice(top, top + peekBody)).map(g => (
+              <Box key={`file-${g.file}-${g.lines[0]?.new ?? 0}`} flexDirection="column">
+                <Text bold color={theme.accent} wrap="truncate-start">{`▸ ${g.file}`}</Text>
+                <Code source={diffWindow(g.lines, 0, g.lines.length * 2, peekLeft)} format="diff" path={g.file} wrap="truncate-end" />
+              </Box>
+            ))
+          ) : peek.lines.length > 0 ? (
+            <Code source={diffWindow(peek.lines, top, peekBody, peekLeft)} format="diff" path={peek.path} wrap="truncate-end" />
+          ) : peek.text.length > 0 ? (
+            <Code source={peek.text.slice(top, top + peekBody).map(l => l.slice(peekLeft)).join('\n')} path={peek.path} startLine={top + 1} wrap="truncate-end" />
+          ) : null}
+        </Box>
+      )
     }
     if (t.preview) {
       if (previewed?.path !== t.preview) await loadPreview($, t.preview)
@@ -1404,7 +2284,7 @@ export const register: Register = (on, options) => {
       return (
         <Box flexDirection="column" minHeight={Math.max(1, e.props.scroll?.bodyRows ?? 1)} backgroundColor={theme.bg || undefined}>
           <Box flexDirection="row">
-            <Button key="back" plain hotkey="h" autoFocus={editWithSetting || inTmux ? undefined : true} label={unicode ? '← files' : '\u{f004d} files'} onPress={() => void closePreview($)} />
+            <Button key="back" plain hotkey="a" autoFocus={editWithSetting || inTmux ? undefined : true} label={unicode ? '← files' : '\u{f004d} files'} onPress={() => void closePreview($)} />
             <Text> </Text>
             <Box flexShrink={1} flexGrow={1}>
               <Text bold wrap="truncate-start">{name}</Text>
@@ -1413,8 +2293,8 @@ export const register: Register = (on, options) => {
             {button(external)}
           </Box>
           <Box flexDirection="row" gap={2}>
-            {([['j', '↓', '\u{f0045}', 1], ['k', '↑', '\u{f005d}', -1], ['f', 'page ↓', '\u{f0045} page', previewRows - 2], ['b', 'page ↑', '\u{f005d} page', 2 - previewRows]] as const).map(([k, plain, nerd, by]) => (
-              <Button key={`pv-${k}`} plain dimColor hotkey={k} label={unicode ? plain : nerd} onPress={() => void scrollPreview($, by).then(() => parkPreview($))} />
+            {([['s', '↓', '\u{f0045}', 1], ['w', '↑', '\u{f005d}', -1], ['f', 'page ↓', '\u{f0045} page', previewRows - 2], ['b', 'page ↑', '\u{f005d} page', 2 - previewRows]] as const).map(([k, plain, nerd, by]) => (
+              <Button key={`pv-${k}`} plain dimColor hotkey={k} label={unicode ? plain : `${nerd} `} onPress={() => void scrollPreview($, by).then(() => parkPreview($))} />
             ))}
             {editWithSetting || inTmux ? <Button key="edit" plain dimColor autoFocus hotkey="e" label={`${unicode ? 'edit' : '\u{f03eb} edit'} :${previewLine}`} onPress={() => void editPreview($, t.preview)} /> : null}
           </Box>
@@ -1427,6 +2307,24 @@ export const register: Register = (on, options) => {
         </Box>
       )
     }
+    const viewing = e.props.view?.agentId
+    agentView = viewing
+    const liveNow = await liveAgents($)
+    const agents = liveNow.filter(a => touchedBy(a.id).length && seenFrom(liveNow, viewing, a.id))
+    const viewed = viewing ? liveNow.find(a => a.id === viewing) : undefined
+    const marks = new Map(agents.map(a => [a.id, new Set(touchedBy(a.id))]))
+    const agentsAt = (id: string, dir: boolean) =>
+      agents.filter(a => {
+        const seen = marks.get(a.id)
+        if (!seen) return false
+        if (seen.has(id)) return true
+        if (dir) for (const p of seen) if (inside(id, p)) return true
+        return false
+      })
+    // A file two live agents both wrote: the tree warns on it and on the closed folders above it.
+    const writes = agents.flatMap(a => book.writes[a.id] ?? [])
+    const conflicts = new Set(writes.filter((p, i) => writes.indexOf(p) !== i))
+    const clashAt = (id: string, dir: boolean) => conflicts.has(id) || (dir && [...conflicts].some(p => inside(id, p)))
     const now = await $.clock.now()
     const live = (await activities($)).filter(a => now - a.at < (a.state === 'running' ? RUNNING_MAX_MS : ACTIVITY_TTL_MS))
     const latest = [...live].reverse().find(a => a.state === 'running') ?? live[live.length - 1]
@@ -1436,7 +2334,7 @@ export const register: Register = (on, options) => {
     const untracked = new Set(t.untrackedDirs)
     const width = Math.max(24, e.props.bodyColumns)
     const rows = visibleRows(t)
-    const fixed = 3 + (t.top ? (t.branch ? 1 : 0) : showHints ? 1 : 0) + (t.selected || latest ? 1 : 0)
+    const fixed = 5 + (viewed ? 1 : 0) + (promptHint ? 1 : 0) + (t.top ? (t.branch ? 1 : 0) : showHints ? 1 : 0) + (t.selected || latest ? 1 : 0) + 1
     const room = nativeScroll ? Math.max(1, rows.length) : Math.max(5, (e.props.scroll?.bodyRows ?? 40) - fixed)
     const isLit = (id: string) => bright.has(id) || dimmed.has(id)
     const focus = followClaude && t.flashOn ? ([...t.flash].reverse().find(id => id !== BRANCH_ROW) ?? t.cursor) : t.cursor
@@ -1510,7 +2408,12 @@ export const register: Register = (on, options) => {
       const dirCounts = n.kind === 'dir' ? countSegs(t.counts[n.id]) : []
       const badge = dirCounts.length ? '' : status ? ` ${status}` : isIgnored ? (unicode ? ' ⊘' : ' \u{f05e}') : '  '
       const countsText = dirCounts.map(c => c.t).join('')
-      const cols = Math.max(4, width - r.depth * 2 - 6 - (meta ? meta.length + 1 : 0) - locText.length - badge.length - countsText.length)
+      // An open folder leaves the dots to its rows; a closed one gathers its agents.
+      const here = n.kind === 'dir' && r.open ? [] : agentsAt(n.id, n.kind === 'dir')
+      const dots: Seg[] = here.length ? [{ t: ' ' }, ...here.slice(0, AGENT_DOTS).map(a => ({ t: '●', c: colorOf(a.id) })), ...(here.length > AGENT_DOTS ? [{ t: `+${here.length - AGENT_DOTS}`, c: theme.muted }] : [])] : []
+      if (clashAt(n.id, n.kind === 'dir' && !r.open)) dots.push({ t: ' ⚠', c: theme.urgent, b: true })
+      const dotsWidth = dots.reduce((w, d) => w + d.t.length, 0)
+      const cols = Math.max(4, width - r.depth * 2 - 6 - (meta ? meta.length + 1 : 0) - locText.length - badge.length - countsText.length - dotsWidth)
       const name = n.name.length > cols ? n.name.slice(0, cols - 1) + '…' : n.name
       const caret = n.kind === 'dir' ? (unicode ? (r.open ? '▾' : '▸') : r.open ? CHEVRON_OPEN : CHEVRON_CLOSED) + ' ' : '  '
       const isRepo = n.kind === 'dir' && n.id === t.top
@@ -1521,6 +2424,7 @@ export const register: Register = (on, options) => {
         { t: caret, c: theme.muted },
         lit ? { t: glyph + ' ', sh: tone, dim: isDim, one: true } : { t: glyph + ' ', c: iconColor },
         lit ? { t: name, sh: tone, dim: isDim, b: isBright } : { t: name, c: nameColor, b: n.id === t.selected, s: status === 'D' && n.kind !== 'dir' },
+        ...dots,
       ]
       const right: Seg[] = []
       if (meta) right.push({ t: ` ${meta}`, c: theme.muted })
@@ -1533,7 +2437,13 @@ export const register: Register = (on, options) => {
 
     const note = (text: string): RowSpec => ({ id: '', left: [{ t: text, c: theme.muted }], right: [] })
     const specs: RowSpec[] = [
-      ...(rows.length === 0 ? [note('empty')] : []),
+      ...(rows.length > 0
+        ? []
+        : t.tab !== 'changes'
+          ? [note('empty')]
+          : t.top
+            ? [note(''), { id: '', left: [{ t: '  ✨ No changed files', c: addColor, b: true }], right: [] }, note('  Working tree is clean, nothing to commit.')]
+            : [note(''), { id: '', left: [{ t: '  📂 Not a git repository', b: true }], right: [] }, note('  Changes show up here after git init.')]),
       ...pinned.map(rowSpec),
       ...(pinned.length > 0 ? [note('  ⋮')] : []),
       ...shown.map(rowSpec),
@@ -1603,15 +2513,226 @@ export const register: Register = (on, options) => {
 
     const park = () => void $.ui.focus({ requestId: PANE, key: 'nav-o' }).catch(() => {})
 
+    // The footer's file acts: + new and, with a file selected, delete; each asks before it acts.
+    // The naming row keeps one shape while typing: a redraw that changes it hands the keys back.
+    const fileBar = () => {
+      const rel = (p: string) => (p === t.root ? '' : relative(t.root, p))
+      if (fileAct?.kind === 'delete') {
+        const target = fileAct.path
+        return (
+          <Box key="file-bar" flexDirection="row" gap={1}>
+            <Box flexShrink={1}>
+              <Text color={theme.urgent} wrap="truncate-start">{`Delete ${rel(target)}?`}</Text>
+            </Box>
+            <Button key="delete-yes" plain autoFocus label="yes, delete" onPress={() => void deleteFile($, target)} />
+            <Button key="delete-no" plain dimColor label="cancel" onPress={() => cancelAct($)} />
+          </Box>
+        )
+      }
+      if (fileAct?.kind === 'new') {
+        const where = rel(fileAct.dir)
+        return (
+          <Box key="file-bar" flexDirection="row" gap={1}>
+            <Box flexGrow={1} flexShrink={1}>
+              <Input
+                key="new-name"
+                autoFocus
+                label={`+ ${where ? `${where}/` : ''}`}
+                placeholder="name, or name/ for a folder"
+                submitLabel="create"
+                value=""
+                onInput={(v: string) => {
+                  if (fileAct?.kind === 'new') fileAct.name = v
+                }}
+                onSubmit={(v: string) => void createNew($, v)}
+              />
+            </Box>
+            <Button key="new-save" plain label="save" onPress={() => void createNew($)} />
+            <Button key="new-cancel" plain dimColor label="cancel" onPress={() => cancelAct($)} />
+          </Box>
+        )
+      }
+      const selectedFile = t.selected && t.selected !== t.root && inside(t.root, t.selected) && t.nodes.some(n => n.id === t.selected && n.kind !== 'dir') ? t.selected : ''
+      return (
+        <Box key="file-bar" flexDirection="row" gap={2}>
+          <Button key="file-new" plain dimColor label="+ new" onPress={() => void startNew($)} />
+          {selectedFile ? <Button key="file-delete" plain dimColor label="✕ delete" onPress={() => {
+            fileAct = { kind: 'delete', path: selectedFile }
+            void $.ui.invalidate('ui.render')
+          }} /> : null}
+        </Box>
+      )
+    }
+
+    const changedCount = Object.values(t.top ? (t.counts[t.root] ?? [0, 0, 0]) : [0, 0, 0]).reduce((a, b) => a + b, 0)
+    const tabs = [
+      { id: 'files', key: '1', label: 'files', enabled: true },
+      { id: 'changes', key: '2', label: changedCount ? `changes ${changedCount}` : 'changes', enabled: true },
+      { id: 'graph', key: '3', label: 'graph', enabled: Boolean(t.top) },
+      { id: 'agents', key: '4', label: Object.keys(book.last).length ? `agents ${Object.keys(book.last).length}` : 'agents', enabled: true },
+    ] as const
+    const activeTab = tabs.find(x => x.id === t.tab)?.enabled ? t.tab : 'files'
+    // Each tab is one cell, its underline as wide: heavy under the open tab, a thin rule under the rest.
+    const cell = (x: (typeof tabs)[number]) => `${x.key}: ${x.label}`.length + 2
+    const tabBar = [
+      <Box key="tabs" flexDirection="row">
+        {tabs.map(x => (
+          <Box key={`tab-${x.id}-cell`} flexDirection="row">
+            <Text> </Text>
+            {x.enabled ? (
+              <Button key={`tab-${x.id}`} plain hotkey={x.key} dimColor={activeTab !== x.id} label={x.label} onPress={() => void showTab($, x.id).then(park)} />
+            ) : (
+              // No Button while the tab has nothing to show: it stays in place and takes no press.
+              <Text color={theme.muted}>{`${x.key}: ${x.label}`}</Text>
+            )}
+            <Text> </Text>
+          </Box>
+        ))}
+      </Box>,
+      <Box key="tabs-rule" flexDirection="row" height={1} overflow="hidden">
+        {tabs.map(x => (
+          <Text key={`rule-${x.id}`} color={activeTab === x.id ? theme.accent : theme.muted}>
+            {(activeTab === x.id ? '━' : '─').repeat(cell(x))}
+          </Text>
+        ))}
+        <Text color={theme.muted}>{'─'.repeat(Math.max(0, e.props.bodyColumns - tabs.reduce((w, x) => w + cell(x), 0)))}</Text>
+      </Box>,
+      viewed ? (
+        <Box key="viewing" flexDirection="row">
+          <Text color={colorOf(viewed.id)}>{' ● '}</Text>
+          <Box flexShrink={1}>
+            <Text bold wrap="truncate-end">{viewed.name || viewed.description || viewed.type}</Text>
+          </Box>
+          <Text color={theme.muted}>{' · showing its work'}</Text>
+        </Box>
+      ) : null,
+      promptHint ? (
+        <Box key="prompt-path" flexDirection="row">
+          <Text color={promptHint.state === 'missing' ? theme.urgent : promptHint.state === 'outside' ? theme.muted : theme.accent}>
+            {{ found: ' ⌕ ', partial: ' ⌕ ', missing: ' ✗ ', outside: ' ↗ ' }[promptHint.state]}
+          </Text>
+          <Box flexShrink={1}>
+            <Text bold color={promptHint.state === 'missing' ? theme.urgent : theme.fg || undefined} wrap="truncate-start">
+              {promptHint.state === 'partial' ? `${promptHint.typed}…` : promptHint.typed}
+            </Text>
+          </Box>
+          <Text color={promptHint.state === 'missing' ? theme.urgent : promptHint.state === 'found' ? addColor : theme.muted}>
+            {{ found: ' ✓', partial: ` · ${promptHint.matches} match${promptHint.matches === 1 ? '' : 'es'}`, missing: ' · path does not exist', outside: ' · outside this tree' }[promptHint.state]}
+          </Text>
+        </Box>
+      ) : null,
+    ]
+
+    if (activeTab === 'agents') {
+      const list = await agentRows($, viewing)
+      if (!list.some(r => r.id === agentCursor)) agentCursor = list[0]?.id ?? ''
+      const room = Math.max(5, (e.props.scroll?.bodyRows ?? 40) - (5 + (viewed ? 1 : 0)))
+      agentRoom = room
+      agentTop = Math.max(0, Math.min(agentTop, list.length - room))
+      const from = agentTop
+      const agentSpecs: RowSpec[] = list.slice(from, from + room).map(r => {
+        const pad = '  '.repeat(r.depth)
+        if (r.path) {
+          const name = inside(t.root, r.path) ? relative(t.root, r.path) : shortPath(r.path)
+          return { id: r.id, left: clean([{ t: `${pad}    ${r.write ? '✎' : '·'} `, c: r.write ? addColor : theme.muted }, { t: name, c: theme.fg || undefined }]), right: [] }
+        }
+        const last = book.last[r.agent]
+        const color = colorOf(r.agent)
+        const open = agentOpen.has(r.agent)
+        return {
+          id: r.id,
+          left: clean([
+            { t: `${pad}${r.depth ? '↳ ' : ''}${open ? '▾' : '▸'} `, c: theme.muted },
+            { t: r.live ? '● ' : '○ ', c: color },
+            { t: nameOf(r.agent), c: r.live ? theme.fg || undefined : theme.muted, b: r.live },
+            { t: ` ✎${book.writes[r.agent]?.length ?? 0}`, c: addColor },
+            { t: ` · ${book.reads[r.agent]?.length ?? 0}`, c: theme.muted },
+            ...(last ? [{ t: `  ${last.text}`, c: theme.muted }] : []),
+          ]),
+          right: last ? [{ t: ` ${age(last.at, now)}`, c: theme.muted }] : [],
+        }
+      })
+      return (
+        <Box flexDirection="column" minHeight={Math.max(1, e.props.scroll?.bodyRows ?? 1)} backgroundColor={theme.bg || undefined}>
+          {tabBar}
+          <Box flexDirection="row" gap={2}>
+            {([['w', '↑', '\u{f005d}'], ['s', '↓', '\u{f0045}'], ['a', '←', '\u{f004d}'], ['d', '→', '\u{f0054}']] as const).map(([k, plain, nerd]) => (
+              <Button key={`nav-${k}`} plain dimColor hotkey={k} label={unicode ? plain : `${nerd} `} onPress={() => void agentKey($, k, viewing).then(park)} />
+            ))}
+            <Button key="nav-o" plain dimColor autoFocus hotkey="o" label={unicode ? 'open' : '\u{f03cb} open'} onPress={() => void agentKey($, 'return', viewing)} />
+          </Box>
+          <Client key="rows" module="./rows.tsx" props={{ rows: agentSpecs.length ? agentSpecs : [{ id: '', left: [{ t: '  🤖 No subagents yet', b: true }], right: [] }, { id: '', left: [{ t: '  Their reads and writes show up here as they work.', c: theme.muted }], right: [] }], active: agentCursor, ...rowColors, pointer } satisfies RowsProps} />
+          <Box flexGrow={1} />
+          <Text color={theme.muted} wrap="truncate-end">{'✎ written · read · d opens an agent, o a file\'s diff'}</Text>
+        </Box>
+      )
+    }
+
+    if (activeTab === 'graph') {
+      if (graph.top !== t.top) await loadGraph($)
+      graphRoom = Math.max(5, (e.props.scroll?.bodyRows ?? 40) - (6 + (viewed ? 1 : 0) + (t.branch ? 1 : 0)))
+      graphTop = Math.max(0, Math.min(graphTop, Math.max(0, graph.rows.length - graphRoom)))
+      const refColor: Record<string, string | undefined> = { head: theme.accent, tag: TAG_COLOR, remote: REMOTE_COLOR, branch: addColor }
+      // A narrow pane keeps the commit's words: past this many lanes the rest fold into an ellipsis.
+      const laneCap = Math.max(3, Math.floor((e.props.bodyColumns * 0.4) / 2)) * 2
+      const colors = palette()
+      // A branch checked out in a worktree is marked ⎇, in the color of the subagent working there.
+      const worktreeOf = Object.fromEntries(Object.entries(worktreeCache.branches).map(([root, branch]) => [branch, root]))
+      const ownerOf = (root: string) => Object.keys(book.worktrees).find(id => book.worktrees[id] === root)
+      const commitBy = Object.entries(book.commits)
+      const graphSpecs: RowSpec[] = graph.rows.slice(graphTop, graphTop + graphRoom).map(r => {
+        const head = r.refs.some(ref => refKind(ref, graph.remotes).kind === 'head')
+        const shown = r.cells.length > laneCap ? [...r.cells.slice(0, laneCap - 1), { t: '…', lane: -1 }] : r.cells
+        const lanes: Seg[] = shown.map(x => ({ t: x.t === '●' && head ? '◉' : x.t, c: x.lane < 0 ? theme.muted : colors[x.lane % colors.length], b: x.t === '●' }))
+        const refs: Seg[] = r.refs.map(ref => {
+          const k = refKind(ref, graph.remotes)
+          const wt = k.kind !== 'tag' && k.kind !== 'remote' ? worktreeOf[k.name] : undefined
+          const owner = wt ? ownerOf(wt) : undefined
+          return { t: ` ${k.kind === 'tag' ? '◇ ' : k.kind === 'head' ? '◉ ' : wt ? '⎇ ' : ''}${k.name}`, c: owner ? colorOf(owner) : refColor[k.kind], b: true }
+        })
+        const by = commitBy.find(([sha]) => sha && r.hash.startsWith(sha))?.[1]
+        return {
+          id: `#commit:${r.hash}`,
+          left: clean([...lanes, { t: ` ${r.short}`, c: theme.muted }, ...(by ? [{ t: ' ●', c: colorOf(by) }] : []), ...refs, { t: ` ${r.subject}`, c: theme.fg || undefined }]),
+          right: [{ t: ` ${age(r.at, now)}`, c: theme.muted }],
+        }
+      })
+      const commits = graph.rows.length
+      return (
+        <Box flexDirection="column" minHeight={Math.max(1, e.props.scroll?.bodyRows ?? 1)} backgroundColor={theme.bg || undefined}>
+          {tabBar}
+          <Box flexDirection="row">
+            <Text bold color={theme.accent} wrap="truncate-start">
+              {header}
+            </Text>
+            <Box flexGrow={1} />
+            {button({ id: 'refresh', label: unicode ? '↻' : '\u{f0450}', dim: true })}
+            <Text> </Text>
+          </Box>
+          {branchRow()}
+          <Box flexDirection="row" gap={2}>
+            {([['w', '↑', '\u{f005d}'], ['s', '↓', '\u{f0045}']] as const).map(([k, plain, nerd]) => (
+              <Button key={`nav-${k}`} plain dimColor hotkey={k} label={unicode ? plain : `${nerd} `} onPress={() => void graphKey($, k)} />
+            ))}
+            <Button key="nav-o" plain dimColor autoFocus hotkey="o" label={unicode ? 'diff' : '\u{f0440} diff'} onPress={() => void graphKey($, 'return')} />
+          </Box>
+          <Client key="rows" module="./rows.tsx" props={{ rows: graphSpecs.length ? graphSpecs : [{ id: '', left: [{ t: 'no commits yet', c: theme.muted }], right: [] }], active: `#commit:${graphCursor}`, ...rowColors, pointer } satisfies RowsProps} />
+          <Box flexGrow={1} />
+          <Text color={theme.muted} wrap="truncate-end">{`${commits} commits${commits >= GRAPH_LIMIT ? '+' : ''} · double-click or o for its diff`}</Text>
+        </Box>
+      )
+    }
+
     return (
       <Box flexDirection="column" minHeight={Math.max(1, e.props.scroll?.bodyRows ?? 1)} backgroundColor={theme.bg || undefined}>
+        {tabBar}
         <Box flexDirection="row">
           <Text bold color={theme.accent} wrap="truncate-start">
             {header}
           </Text>
           <Box flexGrow={1} />
           {hint(buttons, header.length)}
-          <Box flexDirection="row" gap={1}>
+          <Box flexDirection="row" gap={unicode ? 1 : 0}>
             {buttons.map(button)}
             <Text> </Text>
           </Box>
@@ -1630,14 +2751,14 @@ export const register: Register = (on, options) => {
               onSubmit={(v: string) => void jump($, v).then(() => $.clock.after(100, park))}
             />
           </Box>
-          {t.query ? <Button key="clear" plain dimColor label={unicode ? '×' : '\u{f0156}'} onPress={() => void search($, '')} /> : null}
+          {t.query ? <Button key="clear" plain dimColor label={unicode ? '×' : '\u{f0156} '} onPress={() => void search($, '')} /> : null}
         </Box>
         <Box flexDirection="row" gap={2}>
-          {([['j', '↓', '\u{f0045}'], ['k', '↑', '\u{f005d}'], ['h', '←', '\u{f004d}'], ['l', '→', '\u{f0054}']] as const).map(([k, plain, nerd]) => (
-            <Button key={`nav-${k}`} plain dimColor hotkey={k} label={unicode ? plain : nerd} onPress={() => void navigate($, k).then(park)} />
+          {([['w', '↑', '\u{f005d}'], ['s', '↓', '\u{f0045}'], ['a', '←', '\u{f004d}'], ['d', '→', '\u{f0054}']] as const).map(([k, plain, nerd]) => (
+            <Button key={`nav-${k}`} plain dimColor hotkey={k} label={unicode ? plain : `${nerd} `} onPress={() => void navigate($, k).then(park)} />
           ))}
           <Button key="nav-o" plain dimColor autoFocus hotkey="o" label={unicode ? 'open' : '\u{f03cb} open'} onPress={() => void navigate($, 'return')} />
-          <Button key="nav-s" plain dimColor hotkey="s" label={unicode ? 'search' : '\u{f0349} search'} onPress={() => void $.ui.focus({ requestId: PANE, key: 'q' })} />
+          <Button key="nav-f" plain dimColor hotkey="f" label={unicode ? 'find' : '\u{f0349} find'} onPress={() => void $.ui.focus({ requestId: PANE, key: 'q' })} />
         </Box>
         <Client
           key="rows"
@@ -1658,6 +2779,7 @@ export const register: Register = (on, options) => {
             {latest && chip(latest)}
           </Box>
         )}
+        {fileBar()}
       </Box>
     )
   })

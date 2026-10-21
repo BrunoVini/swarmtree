@@ -53,6 +53,19 @@ export type FileTree = {
   scroll: number | null
   preview: string
   previewTop: number
+  tab: 'files' | 'changes' | 'graph' | 'agents'
+}
+
+// What the subagents did this session, kept across a reload: each one's color (an index into the palette),
+// the files it read and wrote, its name, its worktree, its last call, and the commits it made (short sha to id).
+export type AgentBook = {
+  colors: Record<string, number>
+  reads: Record<string, string[]>
+  writes: Record<string, string[]>
+  names: Record<string, string>
+  worktrees: Record<string, string>
+  last: Record<string, { text: string; at: number }>
+  commits: Record<string, string>
 }
 
 export type Theme = {
@@ -70,6 +83,7 @@ declare module 'claude-code' {
       tree: FileTree
       theme: Theme
       activity: Activity[]
+      agents: AgentBook
     }
   }
 }
