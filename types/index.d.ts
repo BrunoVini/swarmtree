@@ -79,7 +79,7 @@ export type Theme = {
 
 declare module 'claude-code' {
   interface PluginState {
-    filetree: {
+    swarmtree: {
       tree: FileTree
       theme: Theme
       activity: Activity[]

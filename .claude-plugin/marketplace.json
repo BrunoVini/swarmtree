@@ -1,15 +1,15 @@
 {
-  "name": "claude-code-filetree",
+  "name": "swarmtree",
   "owner": {
-    "name": "Kurt Buhler"
+    "name": "Bruno Souza"
   },
   "metadata": {
-    "description": "An IDE-style file tree for Claude Code that shows what Claude is doing and where in files"
+    "description": "swarmtree: an IDE-style file tree for Claude Code that keeps up with a swarm of subagents"
   },
   "plugins": [
     {
-      "name": "filetree",
-      "description": "File tree of the session cwd with git status, lines changed, shimmer on files Claude touches and its git activity",
+      "name": "swarmtree",
+      "description": "File tree of the session cwd with git status, per-subagent colors, worktree-aware activity, diff peek and edit, and a commit graph",
       "source": "./"
     }
   ]
