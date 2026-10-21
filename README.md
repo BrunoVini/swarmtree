@@ -94,18 +94,33 @@ All settings are in `/config` under swarmtree.
 
 Clicking rows needs herdr 0.9.1 or later. herdr 0.9.0 and older accept pixel mouse reporting but still send cell positions, which would put every click in the session in the wrong place, so on those versions the rows ignore the mouse and the rest of the pane and session keep working. Run `herdr update` to get row clicks.
 
+## Known limits
+
+- The editor in the peek has no syntax colors while you type, and Enter saves rather than breaking the line (a new line goes in the way it does in the prompt)
+- Creating and deleting from the footer work on Linux and macOS only, and delete never removes a folder
+- A subagent's commit made in a worktree gets its color in the graph when Claude Code reports the commit's hash
+- Needs Claude Code 2.1.306 or newer: the prompt events the tree follows are not in older versions
+
 ## Contributing
 
-Turn on the pre-commit hook once per clone; it runs `claude plugin validate` and the plugin tests before each commit that touches the plugin:
+Changes reach `main` through a pull request: one approval, open review threads resolved, and a squash merge, so each PR lands as one commit; the branch is deleted after the merge. Force-pushes to `main` and deleting it are blocked.
+
+Run the checks before you push:
+
+```bash
+claude plugin validate .claude-plugin/plugin.json
+claude plugin validate .claude-plugin/marketplace.json
+claude plugin test .
+```
+
+Or turn on the pre-commit hook once per clone, which runs them before each commit that touches the plugin:
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
-The same checks run on macOS, Windows and Linux in CI on every push that touches the plugin.
+The same checks run in CI on Linux, macOS and Windows, on Claude Code 2.1.306, for every push and pull request that touches the plugin.
 
 ## License
 
-[MIT](LICENSE)
-
-*This project is inspired by my Omarchy app [FileBlade](https://github.com/data-goblin/fileblade)*
+[MIT](LICENSE), keeping the copyright of the original filetree by Kurt Buhler, whose project was inspired by his Omarchy app [FileBlade](https://github.com/data-goblin/fileblade).
